@@ -1096,7 +1096,6 @@ main()
         self.assertNotEqual(grads[1], None)
         self.assertNotEqual(grads[2], None)
 
-    @skipIfXpu(msg="https://github.com/pytorch/pytorch/issues/180661")
     def test_inputs_aliasing_bytecode_attr_mutations(self):
         # Freeze compiled autograd graph
         compiler = torch._dynamo.compiled_autograd.AutogradCompilerInstance(compiler_fn)
@@ -3241,7 +3240,6 @@ main()
         # (no GPU devices to use cudagraphs with)
         self.assertEqual(counters["inductor"]["cudagraph_skips"], 1)
 
-    @skipIfXpu(msg="cudagraphs not supported on xpu for now!")
     @requires_gpu_and_triton
     def test_cudagraphs_sdpa(self):
         query = torch.rand(
