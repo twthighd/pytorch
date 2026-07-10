@@ -91,7 +91,13 @@ from ..utils import (
 from .base import (
     AsPythonConstantNotImplementedError,
     AttributeMutationNew,
+    build,
+    GetSet,
+    Member,
+    Method,
+    MethodFlags,
     NO_SUCH_SUBOBJ,
+    read,
     ValueMutationNew,
     VariableTracker,
 )
@@ -734,15 +740,20 @@ class UserFunctionVariable(BaseUserFunctionVariable):
 
         return result
 
+    # func.__get__ binds the function to an instance via the tp_descr_get slot
+    # wrapper. https://github.com/python/cpython/blob/v3.13.0/Objects/funcobject.c#L1119
+    def _get_dunder_get(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        source = self.get_source()
+        source = source and AttrSource(source, "__get__")
+        return VariableTracker.build(tx, self.fn.__get__, source)
+
+    tp_getset = {"__get__": GetSet(_get_dunder_get, None)}
+
     def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         if name == "__dict__":
             return super().getattro_impl(tx, name)
-        elif name == "__get__":
-            source = self.get_source()
-            source = source and AttrSource(source, "__get__")
-            return VariableTracker.build(tx, self.fn.__get__, source)
         elif name in cmp_name_to_op_mapping:
             return variables.GetAttrVariable(
                 self, name, py_type=type(getattr(self.fn, name))
@@ -1285,187 +1296,204 @@ class LocalGeneratorObjectVariable(VariableTracker):
     def _is_generator_exhausted(self) -> bool:
         return getattr(self.inline_tracer, "generator_exhausted", False)
 
-    def call_method(
+    def send(
         self,
         tx: "InstructionTranslatorBase",
-        name: str,
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        if name == "send":
-            # Sends a value into the generator function. Returns the next value
-            # yielded by the generator, or raises StopIteration if the generator
-            # exits without yielding another value
-            if self._is_generator_just_started() and len(args):
-                # can't send non-None value to a just-started generator
-                # Test: GeneratorCPythonTests.test_send_non_none_to_new_gen
-                if not all(arg.is_constant_none() for arg in args):
-                    raise_observed_exception(TypeError, tx)
-            return self.gen_send_ex2(tx, args[0])
-        elif name == "close":
-            # * Raises a GeneratorExit at the point where the generator function was paused.
-            # * If the generator function catches the exception and returns a
-            # value, this value is returned from close() - Python 3.13+
-            # * If the generator function is already closed, or raises GeneratorExit
-            # (by not catching the exception), close() returns None.
-            # * If the generator yields a value, a RuntimeError is raised.
-            # * If the generator raises any other exception, it is propagated to the caller.
-            # * If the generator has already exited due to an exception or normal
-            # exit, close() returns None and has no other effect.
+        # Sends a value into the generator function. Returns the next value
+        # yielded by the generator, or raises StopIteration if the generator
+        # exits without yielding another value
+        if self._is_generator_just_started() and len(args):
+            # can't send non-None value to a just-started generator
+            # Test: GeneratorCPythonTests.test_send_non_none_to_new_gen
+            if not all(arg.is_constant_none() for arg in args):
+                raise_observed_exception(TypeError, tx)
+        return self.gen_send_ex2(tx, args[0])
 
-            # Return None if close is called on a just-started generator
-            # See test GeneratorCloseCpythonTests::test_close_not_started
+    def close(
+        self,
+        tx: "InstructionTranslatorBase",
+        args: list[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker | None:
+        # * Raises a GeneratorExit at the point where the generator function was paused.
+        # * If the generator function catches the exception and returns a
+        # value, this value is returned from close() - Python 3.13+
+        # * If the generator function is already closed, or raises GeneratorExit
+        # (by not catching the exception), close() returns None.
+        # * If the generator yields a value, a RuntimeError is raised.
+        # * If the generator raises any other exception, it is propagated to the caller.
+        # * If the generator has already exited due to an exception or normal
+        # exit, close() returns None and has no other effect.
 
-            tracer = self.inline_tracer
-            if self._is_generator_just_started() or self._is_generator_exhausted():
+        # Return None if close is called on a just-started generator
+        # See test GeneratorCloseCpythonTests::test_close_not_started
+
+        tracer = self.inline_tracer
+        if self._is_generator_just_started() or self._is_generator_exhausted():
+            tracer.generator_exhausted = True
+            return variables.ConstantVariable.create(None)
+
+        # Raise GeneratorExit to see if user code catches it. Any other exception
+        # is propagated to the parent frame.
+        try:
+            self._setup_exception(tx, variables.ExceptionVariable(GeneratorExit, []))
+            # There's an extra block on Python 3.12+ to handle StopIteration
+            # see: https://github.com/python/cpython/blob/8f93dd8a8f237b277abad20d566df90c5cbd7f1e/Objects/genobject.c#L394-L397
+            #
+            #   1           0 RETURN_GENERATOR
+            #               2 POP_TOP
+            #               4 RESUME                   0
+
+            #   2           6 LOAD_CONST               1 (1)
+            #               8 YIELD_VALUE              1
+            #              10 RESUME                   1
+            #              12 POP_TOP
+            #              14 RETURN_CONST             0 (None)
+            #         >>   16 CALL_INTRINSIC_1         3 (INTRINSIC_STOPITERATION_ERROR)
+            #              18 RERAISE                  1
+            # ExceptionTable:
+            #   4 to 14 -> 16 [0] lasti
+            if (
+                sys.version_info >= (3, 12)
+                and tracer.next_instruction.opname == "CALL_INTRINSIC_1"
+            ):
                 tracer.generator_exhausted = True
                 return variables.ConstantVariable.create(None)
+        except ObservedGeneratorExit:
+            # If it doesn't catch, we just return None, as per the text above
+            tracer.generator_exhausted = True
+            return variables.ConstantVariable.create(None)
 
-            # Raise GeneratorExit to see if user code catches it. Any other exception
-            # is propagated to the parent frame.
-            try:
-                self._setup_exception(
-                    tx, variables.ExceptionVariable(GeneratorExit, [])
-                )
-                # There's an extra block on Python 3.12+ to handle StopIteration
-                # see: https://github.com/python/cpython/blob/8f93dd8a8f237b277abad20d566df90c5cbd7f1e/Objects/genobject.c#L394-L397
-                #
-                #   1           0 RETURN_GENERATOR
-                #               2 POP_TOP
-                #               4 RESUME                   0
+        try:
+            # Raise RuntimeError if the generator yields any other value
+            # TODO seems like this should send None
+            if tracer.inline_call_():
+                raise_observed_exception(RuntimeError, tx)
+        except ObservedGeneratorExit:
+            tracer.generator_exhausted = True
+            return variables.ConstantVariable.create(None)
+        except ObservedUserStopIteration:
+            # In Python 3.13+, one can capture GeneratorExit and return a value
+            # See test_generator.py::test_close_capture_GeneratorExit_return
+            # https://discuss.python.org/t/let-generator-close-return-stopiteration-value/24786/26
+            # https://github.com/python/cpython/pull/104771
+            if tracer.symbolic_result is None:
+                raise AssertionError(
+                    "expected symbolic_result to be set after StopIteration"
+                ) from None
+            return tracer.symbolic_result
 
-                #   2           6 LOAD_CONST               1 (1)
-                #               8 YIELD_VALUE              1
-                #              10 RESUME                   1
-                #              12 POP_TOP
-                #              14 RETURN_CONST             0 (None)
-                #         >>   16 CALL_INTRINSIC_1         3 (INTRINSIC_STOPITERATION_ERROR)
-                #              18 RERAISE                  1
-                # ExceptionTable:
-                #   4 to 14 -> 16 [0] lasti
-                if (
-                    sys.version_info >= (3, 12)
-                    and tracer.next_instruction.opname == "CALL_INTRINSIC_1"
-                ):
-                    tracer.generator_exhausted = True
-                    return variables.ConstantVariable.create(None)
-            except ObservedGeneratorExit:
-                # If it doesn't catch, we just return None, as per the text above
-                tracer.generator_exhausted = True
-                return variables.ConstantVariable.create(None)
+        # Unreachable in practice: a generator that swallows GeneratorExit and
+        # returns raises StopIteration (caught above). Declining here (return
+        # None) preserves the original `super().call_method` fallthrough.
+        return None
 
-            try:
-                # Raise RuntimeError if the generator yields any other value
-                # TODO seems like this should send None
-                if tracer.inline_call_():
-                    raise_observed_exception(RuntimeError, tx)
-            except ObservedGeneratorExit:
-                tracer.generator_exhausted = True
-                return variables.ConstantVariable.create(None)
-            except ObservedUserStopIteration:
-                # In Python 3.13+, one can capture GeneratorExit and return a value
-                # See test_generator.py::test_close_capture_GeneratorExit_return
-                # https://discuss.python.org/t/let-generator-close-return-stopiteration-value/24786/26
-                # https://github.com/python/cpython/pull/104771
-                if tracer.symbolic_result is None:
-                    raise AssertionError(
-                        "expected symbolic_result to be set after StopIteration"
-                    ) from None
-                return tracer.symbolic_result
-        elif name == "throw":
-            # * Raises an exception at the point where the generator was paused, and
-            # returns the next value yielded by the generator.
-            # * If the generator exits without yielding, raise StopIteration
-            # * If the generator function does not catch the passed-in exception,
-            # or raises a different exception, then that exception propagates to the caller.
+    def throw(
+        self,
+        tx: "InstructionTranslatorBase",
+        args: list[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker:
+        # * Raises an exception at the point where the generator was paused, and
+        # returns the next value yielded by the generator.
+        # * If the generator exits without yielding, raise StopIteration
+        # * If the generator function does not catch the passed-in exception,
+        # or raises a different exception, then that exception propagates to the caller.
 
-            # Setup the exception table and jump target in case of try...finally
-            tracer = self.inline_tracer
-            try:
-                # In Python 3.9, the exception is represented as a triple (typ, val, tb)
-                # In such cases, we re-raise the exception object given to avoid
-                # creating a new object, so that IS_OP works.
-                # See: https://github.com/pytorch/pytorch/pull/146496
-                self._setup_exception(tx, args[1] if len(args) == 3 else args[0])
-            except ObservedException:  # noqa: TRY203
-                # propagate the exception back to the parent caller
-                raise
+        # Setup the exception table and jump target in case of try...finally
+        tracer = self.inline_tracer
+        try:
+            # In Python 3.9, the exception is represented as a triple (typ, val, tb)
+            # In such cases, we re-raise the exception object given to avoid
+            # creating a new object, so that IS_OP works.
+            # See: https://github.com/pytorch/pytorch/pull/146496
+            self._setup_exception(tx, args[1] if len(args) == 3 else args[0])
+        except ObservedException:  # noqa: TRY203
+            # propagate the exception back to the parent caller
+            raise
 
-            retval = tracer.inline_call_()
+        retval = tracer.inline_call_()
 
-            # The exception raised before is still active. We need to check the exception
-            # table one more time to find the next target. But why? Let's walk
-            # through an example and its generated bytecode: https://godbolt.org/z/ebdTbMv8M
-            #
-            #     z = 0
-            #     def whoo():
-            #         global z
-            #         z = 0
-            #         try:
-            #             yield 1
-            #         except ValueError:
-            #             yield 2
-            #         finally:
-            #             z += 1
-            #         z += 10
-            #
-            #     gen = whoo()
-            #     next(gen)
-            #     gen.throw(ValueError)
-            #     print('z', z)  -> z = 1
-            #
-            #              ...
-            #         >>   58 PUSH_EXC_INFO
-            #
-            #   8          60 LOAD_GLOBAL              2 (ValueError)
-            #              70 CHECK_EXC_MATCH
-            #              72 POP_JUMP_IF_FALSE        7 (to 88)
-            #              74 POP_TOP
-            #
-            #   9          76 LOAD_CONST               3 (2)
-            #              78 YIELD_VALUE              3      <------ ValueError is still active here
-            #              80 RESUME                   1
-            #              82 POP_TOP
-            #              84 POP_EXCEPT
-            #              86 jump_backward           34 (to 20)
-            #              ...
-            #
-            #     ExceptionTable:
-            #     4 to 8 -> 124 [0] lasti
-            #     12 to 18 -> 58 [0]
-            #     20 to 56 -> 124 [0] lasti
-            #     58 to 82 -> 90 [1] lasti     <------ move to 90
-            #     84 to 86 -> 96 [0]
-            #     88 to 88 -> 90 [1] lasti
-            #     90 to 94 -> 96 [0]
-            #     96 to 116 -> 118 [1] lasti
-            #     118 to 122 -> 124 [0] lasti
-            #
-            # In this scenario, a generator can yield after `throw()` is called. Even
-            # after the exception is raised a few lines above, it remains active
-            # within the `78 YIELD_VALUE` instruction. When the generator resumes
-            # after the second yield on instruction `80 RESUME`, we cannot simply
-            # return the control flow to the next instruction. Instead, one must
-            # check the exception table (or equivalent) to find the next target
-            # In this case, it says the instruction pointer must be moved to 90.
-            #
-            # Without this step, if we let the trace proceed to the next
-            # instruction, it would follow the control flow where the exception
-            # raised by `throw()` was handled and swallowed, potentially leading
-            # to incorrect behavior.
-            exc_type = type("__InternalThrowException", (Exception,), {})
+        # The exception raised before is still active. We need to check the exception
+        # table one more time to find the next target. But why? Let's walk
+        # through an example and its generated bytecode: https://godbolt.org/z/ebdTbMv8M
+        #
+        #     z = 0
+        #     def whoo():
+        #         global z
+        #         z = 0
+        #         try:
+        #             yield 1
+        #         except ValueError:
+        #             yield 2
+        #         finally:
+        #             z += 1
+        #         z += 10
+        #
+        #     gen = whoo()
+        #     next(gen)
+        #     gen.throw(ValueError)
+        #     print('z', z)  -> z = 1
+        #
+        #              ...
+        #         >>   58 PUSH_EXC_INFO
+        #
+        #   8          60 LOAD_GLOBAL              2 (ValueError)
+        #              70 CHECK_EXC_MATCH
+        #              72 POP_JUMP_IF_FALSE        7 (to 88)
+        #              74 POP_TOP
+        #
+        #   9          76 LOAD_CONST               3 (2)
+        #              78 YIELD_VALUE              3      <------ ValueError is still active here
+        #              80 RESUME                   1
+        #              82 POP_TOP
+        #              84 POP_EXCEPT
+        #              86 jump_backward           34 (to 20)
+        #              ...
+        #
+        #     ExceptionTable:
+        #     4 to 8 -> 124 [0] lasti
+        #     12 to 18 -> 58 [0]
+        #     20 to 56 -> 124 [0] lasti
+        #     58 to 82 -> 90 [1] lasti     <------ move to 90
+        #     84 to 86 -> 96 [0]
+        #     88 to 88 -> 90 [1] lasti
+        #     90 to 94 -> 96 [0]
+        #     96 to 116 -> 118 [1] lasti
+        #     118 to 122 -> 124 [0] lasti
+        #
+        # In this scenario, a generator can yield after `throw()` is called. Even
+        # after the exception is raised a few lines above, it remains active
+        # within the `78 YIELD_VALUE` instruction. When the generator resumes
+        # after the second yield on instruction `80 RESUME`, we cannot simply
+        # return the control flow to the next instruction. Instead, one must
+        # check the exception table (or equivalent) to find the next target
+        # In this case, it says the instruction pointer must be moved to 90.
+        #
+        # Without this step, if we let the trace proceed to the next
+        # instruction, it would follow the control flow where the exception
+        # raised by `throw()` was handled and swallowed, potentially leading
+        # to incorrect behavior.
+        exc_type = type("__InternalThrowException", (Exception,), {})
 
-            try:
-                self._setup_exception(tx, variables.ExceptionVariable(exc_type, []))
-                tracer.inline_call_()
-            except get_dynamo_observed_exception(exc_type):
-                # We should get back the exception raised before.
-                pass
-            else:
-                raise_observed_exception(RuntimeError, tracer)
-            return retval
+        try:
+            self._setup_exception(tx, variables.ExceptionVariable(exc_type, []))
+            tracer.inline_call_()
+        except get_dynamo_observed_exception(exc_type):
+            # We should get back the exception raised before.
+            pass
+        else:
+            raise_observed_exception(RuntimeError, tracer)
+        return retval
 
-        return super().call_method(tx, name, args, kwargs)
+    tp_methods = {
+        "send": Method(send, MethodFlags.VARARGS | MethodFlags.KEYWORDS),
+        "close": Method(close, MethodFlags.VARARGS | MethodFlags.KEYWORDS),
+        "throw": Method(throw, MethodFlags.VARARGS | MethodFlags.KEYWORDS),
+    }
 
 
 class ContextlibContextManagerLocalGeneratorObjectVariable(
@@ -1739,17 +1767,18 @@ class UserMethodVariable(UserFunctionVariable):
             return invoke_and_store_as_constant(tx, fn, self.get_name(), args, kwargs)
         return super().call_function(tx, args, kwargs)
 
-    def getattro_impl(
-        self, tx: "InstructionTranslatorBase", name: str
-    ) -> VariableTracker:
-        if name == "__self__":
-            return self.obj
-        if name == "__func__":
-            # We might have a better way to access the function object, this
-            # information is stored in self.source_fn, use that to construct the
-            # variable tracker.
-            return VariableTracker.build(tx, self.fn, self.source_fn)  # type: ignore[arg-type]
-        return super().getattro_impl(tx, name)
+    def _get_func(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # We might have a better way to access the function object, this
+        # information is stored in self.source_fn, use that to construct the
+        # variable tracker.
+        return VariableTracker.build(tx, self.fn, self.source_fn)  # type: ignore[arg-type]
+
+    # __self__ / __func__ are read-only members on method objects.
+    # https://github.com/python/cpython/blob/v3.13.0/Objects/classobject.c#L20-L24
+    tp_members = {
+        "__self__": Member(read(lambda s: s.obj)),
+        "__func__": Member(_get_func, None),
+    }
 
     def get_real_python_backed_value(self) -> Any:
         return self.fn
@@ -2059,6 +2088,13 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
             func.__annotations__ = annotations
         return func
 
+    # func.__defaults__ getset. https://github.com/python/cpython/blob/v3.13.0/Objects/funcobject.c#L1096
+    def _get_defaults(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        d = getattr(self, "defaults", None)
+        return d.as_python_constant() if d else ConstantVariable.create(None)
+
+    tp_getset = {"__defaults__": GetSet(_get_defaults, None)}
+
     def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
@@ -2073,10 +2109,7 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
             "__type_params__",
         ):
             return super().getattro_impl(tx, name)
-        if name == "__defaults__":
-            d = getattr(self, "defaults", None)
-            return d.as_python_constant() if d else ConstantVariable.create(None)
-        elif name in cmp_name_to_op_mapping:
+        if name in cmp_name_to_op_mapping:
             return variables.GetAttrVariable(
                 self, name, py_type=type(getattr(types.FunctionType, name))
             )
@@ -3018,22 +3051,35 @@ class FunctoolsPartialVariable(VariableTracker):
         # functools.partial uses slots, so attributes are constant
         return VariableTracker.build(tx, hasattr(functools.partial(identity), name))
 
+    # func / args / keywords are read-only members on partial objects.
+    # https://github.com/python/cpython/blob/v3.13.0/Modules/_functoolsmodule.c#L295-L299
+    def _get_func(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        return self.func
+
+    def _get_args(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        source = self.source and AttrSource(self.source, "args")
+        return variables.TupleVariable(self.args, source=source)
+
+    def _get_keywords(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        source = self.source and AttrSource(self.source, "keywords")
+        items = {VariableTracker.build(tx, k): v for k, v in self.keywords.items()}
+        return variables.ConstDictVariable(items, source=source)
+
+    tp_members = {
+        "func": Member(_get_func, None),
+        "args": Member(_get_args, None),
+        "keywords": Member(_get_keywords, None),
+    }
+
     def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
-        source = self.source and AttrSource(self.source, name)
-        # Handle __slots__
-        if name == "func":
-            return self.func
-        if name == "args":
-            return variables.TupleVariable(self.args, source=source)
-        if name == "keywords":
-            items = {VariableTracker.build(tx, k): v for k, v in self.keywords.items()}
-            return variables.ConstDictVariable(items, source=source)
         if name in cmp_name_to_op_mapping:
             return variables.GetAttrVariable(
                 self, name, py_type=type(getattr(functools.partial, name))
             )
+        if name in self.tp_members:
+            return super().getattro_impl(tx, name)
         raise_observed_exception(AttributeError, tx)
 
     def as_python_constant(self) -> Any:
@@ -3492,18 +3538,13 @@ class TritonKernelVariable(VariableTracker):
         # Triton kernel[grid] — triton-specific, not a CPython slot.
         return dynamo_triton_hopifier_singleton.call_getitem(self, [key])
 
-    def call_method(
+    def run(
         self,
         tx: "InstructionTranslatorBase",
-        name: str,
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        if name == "run":
-            return dynamo_triton_hopifier_singleton.call_run(self, args, kwargs, tx)  # type: ignore[return-value]
-
-        # Bail out to parent's implementation
-        return super().call_method(tx, name, args, kwargs)
+        return dynamo_triton_hopifier_singleton.call_run(self, args, kwargs, tx)  # type: ignore[return-value]
 
     def specialize_symbolic(self, arg: Any) -> Any:
         from .constant import ConstantVariable
@@ -3513,6 +3554,8 @@ class TritonKernelVariable(VariableTracker):
         if isinstance(arg, SymNodeVariable):
             return ConstantVariable.create(arg.evaluate_expr())
         return arg
+
+    tp_methods = {"run": Method(run, MethodFlags.VARARGS | MethodFlags.KEYWORDS)}
 
 
 class TMADescriptorExperimentalVariable(VariableTracker):
@@ -3907,6 +3950,8 @@ class TritonSetAllocatorVariable(VariableTracker):
 # ---------------------------------------------------------------------------
 
 
+# descr_members: __objclass__ and __name__ are PyMemberDef on all descriptor
+# types. https://github.com/python/cpython/blob/3.13/Objects/descrobject.c#L641-L645
 class WrapperDescriptorVariable(VariableTracker):
     """Unbound C slot wrapper (wrapper_descriptor on a type).
 
@@ -3952,14 +3997,10 @@ class WrapperDescriptorVariable(VariableTracker):
     def get_real_python_backed_value(self) -> types.WrapperDescriptorType:
         return self.descriptor
 
-    def getattro_impl(
-        self, tx: "InstructionTranslatorBase", name: str
-    ) -> VariableTracker:
-        if name == "__objclass__":
-            return VariableTracker.build(tx, self.descriptor.__objclass__)
-        if name == "__name__":
-            return variables.ConstantVariable.create(self.descriptor.__name__)
-        return super().getattro_impl(tx, name)
+    tp_members = {
+        "__objclass__": Member(build(lambda s: s.descriptor.__objclass__)),
+        "__name__": Member(build(lambda s: s.descriptor.__name__)),
+    }
 
     def call_function(
         self,
@@ -4136,14 +4177,10 @@ class MethodDescriptorVariable(VariableTracker):
     def get_real_python_backed_value(self) -> types.MethodDescriptorType:
         return self.descriptor
 
-    def getattro_impl(
-        self, tx: "InstructionTranslatorBase", name: str
-    ) -> VariableTracker:
-        if name == "__objclass__":
-            return VariableTracker.build(tx, self.descriptor.__objclass__)
-        if name == "__name__":
-            return variables.ConstantVariable.create(self.descriptor.__name__)
-        return super().getattro_impl(tx, name)
+    tp_members = {
+        "__objclass__": Member(build(lambda s: s.descriptor.__objclass__)),
+        "__name__": Member(build(lambda s: s.descriptor.__name__)),
+    }
 
     def call_function(
         self,
@@ -4300,17 +4337,10 @@ class ClassMethodDescriptorVariable(VariableTracker):
     def get_real_python_backed_value(self) -> types.ClassMethodDescriptorType:
         return self.descriptor
 
-    def getattro_impl(
-        self, tx: "InstructionTranslatorBase", name: str
-    ) -> VariableTracker:
-        # descr_members: __objclass__ and __name__ are PyMemberDef on all
-        # descriptor types.
-        # https://github.com/python/cpython/blob/3.13/Objects/descrobject.c#L641-L645
-        if name == "__objclass__":
-            return VariableTracker.build(tx, self.descriptor.__objclass__)
-        if name == "__name__":
-            return variables.ConstantVariable.create(self.descriptor.__name__)
-        return super().getattro_impl(tx, name)
+    tp_members = {
+        "__objclass__": Member(build(lambda s: s.descriptor.__objclass__)),
+        "__name__": Member(build(lambda s: s.descriptor.__name__)),
+    }
 
     def tp_descr_get_impl(
         self,
@@ -4460,17 +4490,10 @@ class MemberDescriptorVariable(VariableTracker):
     def as_python_constant(self) -> types.MemberDescriptorType:
         return self.descriptor
 
-    def getattro_impl(
-        self, tx: "InstructionTranslatorBase", name: str
-    ) -> VariableTracker:
-        # descr_members: __objclass__ and __name__ are PyMemberDef on all
-        # descriptor types.
-        # https://github.com/python/cpython/blob/3.13/Objects/descrobject.c#L641-L645
-        if name == "__objclass__":
-            return VariableTracker.build(tx, self.descriptor.__objclass__)
-        if name == "__name__":
-            return variables.ConstantVariable.create(self.descriptor.__name__)
-        return super().getattro_impl(tx, name)
+    tp_members = {
+        "__objclass__": Member(build(lambda s: s.descriptor.__objclass__)),
+        "__name__": Member(build(lambda s: s.descriptor.__name__)),
+    }
 
     def tp_descr_get_impl(
         self,
@@ -4533,17 +4556,20 @@ class GetSetDescriptorVariable(VariableTracker):
     def get_real_python_backed_value(self) -> types.GetSetDescriptorType:
         return self.descriptor
 
-    def getattro_impl(
-        self, tx: "InstructionTranslatorBase", name: str
-    ) -> VariableTracker:
-        if name == "__get__" and self.source:
-            source = AttrSource(self.source, "__get__")
-            return VariableTracker.build(tx, self.descriptor.__get__, source)
-        elif name in ("__objclass__", "__name__"):
-            source = self.source and AttrSource(self.source, name)
-            return VariableTracker.build(tx, getattr(self.descriptor, name), source)
-        else:
-            return super().getattro_impl(tx, name)
+    def _getset_descriptor_get(self, tx):
+        if not self.source:
+            return None
+        source = AttrSource(self.source, "__get__")
+        return VariableTracker.build(tx, self.descriptor.__get__, source)
+
+    tp_getset = {
+        "__get__": GetSet(_getset_descriptor_get, None),
+    }
+
+    tp_members = {
+        "__objclass__": Member(build(lambda s: s.descriptor.__objclass__)),
+        "__name__": Member(build(lambda s: s.descriptor.__name__)),
+    }
 
     def is_python_constant(self) -> bool:
         return True
@@ -4688,12 +4714,9 @@ class TupleGetterVariable(VariableTracker):
     def as_python_constant(self) -> "_collections._tuplegetter":
         return self.descriptor
 
-    def getattro_impl(
-        self, tx: "InstructionTranslatorBase", name: str
-    ) -> VariableTracker:
-        if name == "__doc__":
-            return VariableTracker.build(tx, self.descriptor.__doc__)
-        return super().getattro_impl(tx, name)
+    # _tuplegetter exposes __doc__ as a T_OBJECT member.
+    # https://github.com/python/cpython/blob/v3.13.0/Modules/_collectionsmodule.c#L2717-L2721
+    tp_members = {"__doc__": Member(build(lambda s: s.descriptor.__doc__))}
 
     def tp_descr_get_impl(
         self,
