@@ -1,5 +1,9 @@
 import torch
 import torch.utils._pytree as pytree
+from torch._inductor.analysis.device_info import (
+    datasheet_dram_bw_gbs, 
+     datasheet_tops,
+)
 from torch._inductor.utils import get_device_tflops, get_gpu_dram_gbps
 from torch.fx.experimental.symbolic_shapes import (
     optimization_hint,
@@ -86,24 +90,50 @@ def _get_device_from_value(value) -> torch.device | None:  # type: ignore[no-unt
 
 
 def flops_to_ns(
-    flops: float | int, dtype: "torch.dtype", device: torch.device | None = None
+    flops: float | int,
+    dtype: "torch.dtype",
+    gpu_type: str | None = None,
+    *,
+    device: torch.device | None = None,
 ) -> float:
-    """Convert a FLOPs count to estimated nanoseconds on the current GPU.
+    """Convert a FLOPs count to estimated nanoseconds on the GPU.
 
     Uses 75% of theoretical peak and converts FLOPs to MACs (divide by 2).
-    """
-    device_tflops = get_device_tflops(dtype, device=device)
 
-    if device_tflops == 0:
+    If ``gpu_type`` names a device in the datasheet, its pinned datasheet
+    TFLOPS are used instead of querying the current device, making the
+    estimate deterministic and hardware-independent.
+    """
+    if gpu_type is not None:
+        is_tf32 = torch.backends.cuda.matmul.fp32_precision == "tf32"
+        tflops = datasheet_tops(
+            dtype,
+            is_tf32=is_tf32,
+            device_name=gpu_type,
+        )
+        if tflops is None:
+            raise ValueError(
+                f"gpu_type {gpu_type!r} has no datasheet entry for {dtype}"
+            )
+    else:
+        tflops = get_device_tflops(dtype, device=device)
+
+    peak_gpu_flops = tflops * 1e12
+    if peak_gpu_flops == 0:
         return 0.0
 
-    peak_gpu_flops = device_tflops * 1e12
     macs = flops / 2
     return (macs / (0.75 * peak_gpu_flops)) * 1e9
 
 
 def get_compute_time(
-    func_packet, args, kwargs, out, out_dtypes, node_meta=None
+    func_packet,
+    args,
+    kwargs,
+    out,
+    out_dtypes,
+    node_meta=None,
+    gpu_type=None,
 ) -> float:  # type: ignore[no-untyped-def]
     """
     Estimates the compute time of an aten operator.
@@ -117,6 +147,8 @@ def get_compute_time(
         node_meta: Optional FX node meta dict. Passed through to the flop
             formula as ``_node_meta`` kwarg so formulas can read annotations
             like ``sparsity_hint``.
+        gpu_type: Optional datasheet device name to pin the peak FLOPS to
+            instead of querying the current device.
 
     Returns:
         float: The estimated compute time in nanoseconds.
@@ -126,15 +158,29 @@ def get_compute_time(
             raise AssertionError(
                 f"Only support single out dtype got {out_dtypes} for {func_packet}"
             )
+
         dtype = out_dtypes.pop()
         flop_count_func = flop_registry[func_packet]
         extra_kwargs = {}
+
         if node_meta is not None:
             extra_kwargs["_node_meta"] = node_meta
-        flop_count = flop_count_func(*args, **kwargs, out_val=out, **extra_kwargs)
+
+        flop_count = flop_count_func(
+            *args,
+            **kwargs,
+            out_val=out,
+            **extra_kwargs,
+        )
 
         device = _get_device_from_value(out)
-        return flops_to_ns(flop_count, dtype, device=device)
+        return flops_to_ns(
+            flop_count,
+            dtype,
+            gpu_type=gpu_type,
+            device=device,
+        )
+
     return 0.0
 
 
@@ -157,27 +203,44 @@ def get_num_bytes(t: torch.Tensor) -> int:
     return real_numel * t.element_size()
 
 
-def get_transfer_time(flat_args_kwargs, flat_outs) -> float:  # type: ignore[no-untyped-def]
+def get_transfer_time(
+    flat_args_kwargs,
+    flat_outs,
+    gpu_type=None,
+) -> float:  # type: ignore[no-untyped-def]
     """
     Estimates the memory transfer time of input and output tensors.
 
     Args:
-        flat_args_kwargs: The flat list of arguments and keyword arguments.
-        flat_outs: The flat list of outputs.
+        flat_args_kwargs (List[torch.Tensor]): The flat list of arguments
+            and keyword arguments.
+        flat_outs (List[torch.Tensor]): The flat list of outputs.
+        gpu_type: Optional datasheet device name to pin the DRAM bandwidth to
+            instead of querying the current device.
 
     Returns:
         float: The estimated memory transfer time in nanoseconds.
     """
-    device = _get_device_from_value((flat_args_kwargs, flat_outs))
-    gpu_memory_bandwidth = get_gpu_dram_gbps(device=device)
+    if gpu_type is not None:
+        gpu_memory_bandwidth = datasheet_dram_bw_gbs(gpu_type)
+        if gpu_memory_bandwidth is None:
+            raise ValueError(f"gpu_type {gpu_type!r} not found in datasheet")
+    else:
+        device = _get_device_from_value((flat_args_kwargs, flat_outs))
+        gpu_memory_bandwidth = get_gpu_dram_gbps(device=device)
+
     if gpu_memory_bandwidth <= 0:
         return 0.0
 
     read_bytes = sum(
-        get_num_bytes(t) for t in flat_args_kwargs if isinstance(t, torch.Tensor)
+        get_num_bytes(t)
+        for t in flat_args_kwargs
+        if isinstance(t, torch.Tensor)
     )
     write_bytes = sum(
-        get_num_bytes(t) for t in flat_outs if isinstance(t, torch.Tensor)
+        get_num_bytes(t)
+        for t in flat_outs
+        if isinstance(t, torch.Tensor)
     )
     counted_bytes = read_bytes + write_bytes
 
