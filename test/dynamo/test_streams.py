@@ -1635,8 +1635,8 @@ class GraphModule(torch.nn.Module):
     def forward(self, primals_1: "f32[2, 2]", primals_2: "f32[2, 2]"):
         # Annotation: {'stream': 2}
         mul: "f32[2, 2]" = torch.ops.aten.mul.Tensor(primals_1, 2)
-        add: "f32[2, 2]" = torch.ops.aten.add.Tensor(mul, primals_2);  primals_2 = None
-        return (add, primals_1, mul)
+        add: "f32[2, 2]" = torch.ops.aten.add.Tensor(mul, primals_2);  mul = primals_2 = None
+        return (add, primals_1)
 """,
         )
         # Run backward and check that the epilogue copy uses stream 0 (s1)
@@ -1649,15 +1649,18 @@ class GraphModule(torch.nn.Module):
             print_graph(bw_graphs[0]),
             """\
 class GraphModule(torch.nn.Module):
-    def forward(self, primals_1: "f32[2, 2]", mul: "f32[2, 2]", tangents_1: "f32[2, 2]"):
+    def forward(self, primals_1: "f32[2, 2]", tangents_1: "f32[2, 2]"):
         # Annotation: {'stream': 2} Backward of forward node:
         mul_2: "f32[2, 2]" = torch.ops.aten.mul.Tensor(tangents_1, 2)
 
         # Annotation: {'stream': 2} Backward of forward node:
         clone: "f32[2, 2]" = torch.ops.aten.clone.default(tangents_1);  tangents_1 = None
 
+        # Annotation: {'stream': 1} Backward of forward node:
+        mul_1: "f32[2, 2]" = torch.ops.aten.mul.Tensor(primals_1, 2)
+
         # Annotation: {'stream': 1} No stacktrace found for following nodes
-        copy_: "f32[2, 2]" = torch.ops.aten.copy_.default(primals_1, mul);  primals_1 = mul = copy_ = None
+        copy_: "f32[2, 2]" = torch.ops.aten.copy_.default(primals_1, mul_1);  primals_1 = mul_1 = copy_ = None
         return (mul_2, clone)
 """,
         )
