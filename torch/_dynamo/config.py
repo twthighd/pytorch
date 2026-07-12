@@ -161,6 +161,9 @@ specialize_int = False
 # support codegen on float (this is to be fixed).
 specialize_float = False
 
+# Recompute unused constants derived from lazy constants in output bytecode instead of guarding on them
+computed_lazy_constants = False
+
 # legacy config, does nothing now!
 dynamic_shapes = True
 
