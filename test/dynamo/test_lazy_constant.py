@@ -602,11 +602,36 @@ class ComputedLazyConstantTests(TestCase):
         def fn(t, a, b):
             return t * (a + b)
 
-        counter = CompileCounter()
-        opt_fn = torch.compile(fn, backend=counter)
-        for a, b in [(1.5, 2.0), (3.25, 4.0)]:
-            self.assertTrue(same(fn(t, a, b), opt_fn(t, a, b)))
-        self.assertGreaterEqual(counter.frame_count, 1)
+        self._check(fn, [(t, 1.5, 2.0), (t, 3.25, 4.0)], expected_frames=2)
+
+    @torch._dynamo.config.patch(computed_lazy_constants=True)
+    def test_computed_constant_as_dict_key_realizes(self):
+        t = torch.ones(2)
+
+        def fn(t, a, b):
+            d = {a + b: t}
+            return d[a + b].sin()
+
+        self._check(fn, [(t, 1, 2), (t, 3, 4)], expected_frames=2)
+
+    @torch._dynamo.config.patch(computed_lazy_constants=True)
+    def test_computed_constant_as_list_index_realizes(self):
+        t = torch.ones(2)
+
+        def fn(t, a, b):
+            lst = [t, t + 1, t + 2]
+            return lst[a + b]
+
+        self._check(fn, [(t, 0, 1), (t, 1, 1)], expected_frames=2)
+
+    @torch._dynamo.config.patch(computed_lazy_constants=False)
+    def test_computed_constant_default_off_recompiles(self):
+        t = torch.ones(2)
+
+        def fn(t, a, b):
+            return t.sin(), a + b
+
+        self._check(fn, [(t, 1, 2), (t, 3, 4), (t, 100, -5)], expected_frames=2)
 
     @torch._dynamo.config.patch(computed_lazy_constants=True)
     def test_computed_constant_type_query_does_not_recompile(self):

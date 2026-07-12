@@ -72,13 +72,11 @@ class ComputedLazyCache:
         lazy_vars: list[LazyConstantVariable],
         args: list[VariableTracker],
         op: Callable[..., Any],
-        op_name: str,
     ) -> None:
         self.value = value
         self.lazy_vars = lazy_vars
         self.args = args
         self.op = op
-        self.op_name = op_name
         self.name_hint: str | None = None
         self.source_location: SourceLocation | None = None
         self.vt: VariableTracker | None = None
@@ -564,7 +562,6 @@ class ComputedLazyConstantVariable(LazyVariableTracker):
     @staticmethod
     def create(  # pyrefly: ignore[bad-param-name-override, bad-override]
         op: Callable[..., Any],
-        op_name: str,
         args: list[VariableTracker],
     ) -> VariableTracker:
         """Compute op(*args) eagerly; raises if the result is not a base literal."""
@@ -589,7 +586,7 @@ class ComputedLazyConstantVariable(LazyVariableTracker):
         if not lazy_vars:
             return ConstantVariable.create(value)
         return ComputedLazyConstantVariable(
-            ComputedLazyCache(value, lazy_vars, list(args), op, op_name)
+            ComputedLazyCache(value, lazy_vars, list(args), op)
         )
 
     def __init__(self, _cache: ComputedLazyCache, **kwargs: Any) -> None:
@@ -661,7 +658,7 @@ class ComputedLazyConstantVariable(LazyVariableTracker):
 
         cache = self._cache
         codegen.add_push_null(
-            lambda: codegen.load_import_from("operator", cache.op_name)
+            lambda: codegen.load_import_from("operator", cache.op.__name__)
         )
         for arg in cache.args:
             codegen(arg)
